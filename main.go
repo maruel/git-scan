@@ -5,15 +5,17 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
@@ -36,30 +38,37 @@ type repositories struct {
 
 func (r *repositories) init() error {
 	// Find all the repositories, sync them all.
-	return filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+	var wg sync.WaitGroup
+	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
 		if strings.HasSuffix(path, "/config") {
-			path = path[:len(path)-7]
-			name := path[len(r.root)+1:]
-			g := &git{
-				root:    path,
-				name:    name,
-				delay:   r.delay,
-				revList: map[string][]string{},
-			}
-			r.repos[name] = g
-			// TODO(maruel): Do this asynchronously.
-			if err := g.updateBranches(false); err != nil {
-				return err
-			}
-			r.wg.Add(1)
+			wg.Add(1)
 			go func() {
-				defer r.wg.Done()
-				g.scanLoop()
+				defer wg.Done()
+				path = path[:len(path)-7]
+				name := path[len(r.root)+1:]
+				g := &git{
+					root:    path,
+					name:    name,
+					delay:   r.delay,
+					revList: map[string][]string{},
+				}
+				r.repos[name] = g
+				// TODO(maruel): Do this asynchronously.
+				if err := g.updateBranches(false); err != nil {
+					log.Fatal(err)
+				}
+				r.wg.Add(1)
+				go func() {
+					defer r.wg.Done()
+					g.scanLoop()
+				}()
 			}()
 			return filepath.SkipDir
 		}
 		return nil
 	})
+	wg.Wait()
+	return err
 }
 
 func (r *repositories) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -73,12 +82,16 @@ func (r *repositories) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 var repoRootTmpl = template.Must(template.New("name").Parse(`<html><body>
 <h1>Repositories</h1><ul>
-{{range .}}<li>{{.}}</li>
+{{range .}}<li><a href="{{.}}.git/">{{.}}</a></li>
 {{end}}</ul>
-To add a repo, visit /&lt;repo.git&gt;/init.
 </body></html>`))
 
 func (r *repositories) rootHandler(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "GET" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		http.Error(w, "Invalid Method", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	r.readLock.Lock()
 	defer r.readLock.Unlock()
@@ -86,6 +99,7 @@ func (r *repositories) rootHandler(w http.ResponseWriter, req *http.Request) {
 	for k := range r.repos {
 		list = append(list, k)
 	}
+	sort.Strings(list)
 	if err := repoRootTmpl.Execute(w, list); err != nil {
 		log.Fatal(err)
 	}
@@ -97,6 +111,7 @@ var (
 )
 
 func (r *repositories) flowHandler(w http.ResponseWriter, req *http.Request) {
+	// TODO(maruel): Rewrite this code.
 	// The first part is the git URL.
 	i := strings.Index(req.URL.Path, ".git")
 	if i < 5 || i == -1 || (len(req.URL.Path) > i+4 && req.URL.Path[i+4] != '/') {
@@ -123,6 +138,7 @@ func (r *repositories) flowHandler(w http.ResponseWriter, req *http.Request) {
 			u := "http://" + req.Host + "/" + repo + ".git/init"
 			http.Error(w, fmt.Sprintf("Visit %s to initialize the repository.", u), 400)
 		} else {
+			// TODO(maruel): Enforce POST.
 			r.addLock.Lock()
 			defer r.addLock.Unlock()
 			g := &git{
@@ -248,67 +264,115 @@ func (g *git) isChild(parent, child string) bool {
 }
 
 func (g *git) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		http.Error(w, "Invalid Method", http.StatusMethodNotAllowed)
+		return
+	}
 	if r.URL.Path == "/" {
 		g.rootHandler(w, r)
 		return
 	}
-
-	if !strings.HasPrefix(r.URL.Path, "/compare/") {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		http.Error(w, "Use /compare/ref1/ref2", 400)
+	if strings.HasPrefix(r.URL.Path, "/compare/") {
+		g.compareHandler(w, r)
 		return
 	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	http.Error(w, "Unknown URL", 404)
+	return
+}
+
+func (g *git) compareHandler(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(r.URL.Path[9:], "/")
 	if len(parts) != 2 {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		http.Error(w, "Use /compare/ref1/ref2", 400)
 		return
 	}
-	parent := strings.ToLower(parts[0])
-	child := strings.ToLower(parts[1])
-	if !isHashValid(parent) || !isHashValid(child) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		http.Error(w, "Use valid commit hash", 400)
-		return
-	}
+	p, _ := g.compare(parts[0], parts[1])
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(&p); err != nil {
+		log.Fatal(err)
+	}
+}
 
+type parentHood struct {
+	ParentValid bool
+	ChildValid  bool
+	Ancestor    bool
+}
+
+func (g *git) compare(parent, child string) (*parentHood, error) {
+	p := &parentHood{}
+	parent = strings.ToLower(parent)
+	child = strings.ToLower(child)
+	if !isHashValid(parent) || !isHashValid(child) {
+		return p, errors.New("use valid commit digests")
+	}
 	g.lock.RLock()
 	defer g.lock.RUnlock()
-	if _, ok := g.revList[parent]; !ok {
-		_, _ = io.WriteString(w, "{\"ok\":false,\"ancestor\":false}")
-		return
-	}
-	if g.isChild(parent, child) {
-		_, _ = io.WriteString(w, "{\"ok\":true,\"ancestor\":true}")
-		return
-	}
-	_, _ = io.WriteString(w, "{\"ok\":true,\"ancestor\":false}")
+	_, p.ParentValid = g.revList[parent]
+	_, p.ParentValid = g.revList[child]
+	p.Ancestor = g.isChild(parent, child)
+	return p, nil
 }
 
 var gitRootTmpl = template.Must(template.New("name").Parse(`<html><body>
 <h1>{{.Name}}</h1><ul>
 {{range $index, $key := .Keys}}<li>{{$key}}: {{index $.Map $key}}</li>
 {{end}}</ul>
+<form method="GET" action="">
+	<table>
+		<tr>
+			<td>Parent:</td>
+			<td><input type="text" name="parent" maxlen=40 size=42 value="{{.Parent}}"></input></td>
+		</tr>
+		<tr>
+			<td>Child:</td>
+			<td><input type="text" name="child" maxlen=40 size=42 value="{{.Child}}"></input></td>
+		</tr>
+		<tr>
+			<td></td>
+			<td><input type="submit" value="Check"></input></td>
+		</tr>
+	</table>
+</form>
+{{.Extra}}<p>
+<em>ps: there's a JSON API</em>
 </body></html>`))
 
 func (g *git) rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	values := r.URL.Query()
+	parent := values.Get("parent")
+	child := values.Get("child")
+	p, err := g.compare(parent, child)
+	extra := ""
+	if err == nil {
+		extra = fmt.Sprintf("Ancestor: %t", p.Ancestor)
+	}
 	g.lock.RLock()
 	defer g.lock.RUnlock()
 	list := make([]string, 0, len(g.branches))
 	for k := range g.branches {
 		list = append(list, k)
 	}
+	sort.Strings(list)
 	t := &struct {
-		Name string
-		Keys []string
-		Map  map[string]string
+		Name   string
+		Keys   []string
+		Map    map[string]string
+		Parent string
+		Child  string
+		Extra  string
 	}{
 		g.name,
 		list,
 		g.branches,
+		parent,
+		child,
+		extra,
 	}
 	if err := gitRootTmpl.Execute(w, t); err != nil {
 		log.Fatal(err)
@@ -344,9 +408,16 @@ func mainImpl() error {
 		addr = fmt.Sprintf("localhost:%d", *port)
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/favicon.ico", restrictFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO(maruel): Eh.
+		http.Redirect(w, r, "https://git-scm.com/images/logos/downloads/Git-Icon-1788C.png", http.StatusFound)
+	}, "GET"))
+	mux.Handle("/", repos)
+
 	s := &http.Server{
 		Addr:    addr,
-		Handler: exitOnPanic{&loggingHandler{repos, nil}},
+		Handler: exitOnPanic{&loggingHandler{mux, nil}},
 	}
 
 	// TODO(maruel): Handle Ctrl-C to quick shutdown but wait for git operations.
