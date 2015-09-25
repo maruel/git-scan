@@ -225,7 +225,7 @@ func (g *git) scanLoop() {
 	for {
 		select {
 		case <-interrupt.Channel:
-			break
+			return
 		case <-time.After(g.delay):
 			if err := g.fetch(); err != nil {
 				log.Fatal(err)
