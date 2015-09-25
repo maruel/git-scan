@@ -66,16 +66,24 @@ func scanParentHood(root string, branches map[string]string) (map[string][]strin
 			return nil, err
 		}
 		scanner := bufio.NewScanner(stdout)
+		skip := false
 		for scanner.Scan() {
+			if skip {
+				continue
+			}
 			parts := strings.Split(scanner.Text(), " ")
 			if len(parts) <= 1 {
-				break
+				skip = true
+				continue
 			}
 			if _, ok := revList[parts[0]]; !ok {
 				children := make([]string, len(parts)-1)
 				copy(children, parts[1:])
 				revList[parts[0]] = children
 			}
+		}
+		if err := cmd.Wait(); err != nil {
+			return nil, err
 		}
 	}
 	return revList, nil
