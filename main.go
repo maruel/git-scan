@@ -215,7 +215,7 @@ func (g *git) init(w http.ResponseWriter) {
 	start := time.Now()
 	repo := "https://" + g.name
 	g.logger.Printf("Cloning %s into %s", repo, g.root)
-	cmd := exec.Command("git", "clone", "--mirror", "--verbose", repo, g.root)
+	cmd := exec.Command("git", "clone", "--mirror", "--progress", "--verbose", repo, g.root)
 	w.WriteHeader(http.StatusOK)
 	cmd.Stdout = w
 	cmd.Stderr = w
