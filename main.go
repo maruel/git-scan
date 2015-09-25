@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -26,9 +27,20 @@ import (
 	"github.com/maruel/interrupt"
 )
 
+var footerTmpl = template.Must(template.New("name").Parse(`<script>
+(function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+(i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+})(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+ga('create', '{{.UA}}', 'auto');
+ga('send', 'pageview');
+</script>`))
+
+// TODO(maruel): Split the model-view.
 type repositories struct {
-	root  string
-	delay time.Duration
+	root   string
+	delay  time.Duration
+	footer string // HTML safe pre-generated footer.
 
 	wg       sync.WaitGroup
 	readLock sync.Mutex
@@ -50,6 +62,7 @@ func (r *repositories) init() error {
 					root:    path,
 					name:    name,
 					delay:   r.delay,
+					footer:  r.footer,
 					revList: map[string][]string{},
 				}
 				r.repos[name] = g
@@ -72,7 +85,6 @@ func (r *repositories) init() error {
 }
 
 func (r *repositories) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// TODO(maruel): Split the model-view.
 	if req.URL.Path == "/" {
 		r.rootHandler(w, req)
 	} else {
@@ -82,9 +94,9 @@ func (r *repositories) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 var repoRootTmpl = template.Must(template.New("name").Parse(`<html><body>
 <h1>Repositories</h1><ul>
-{{range .}}<li><a href="{{.}}.git/">{{.}}</a></li>
+{{range .Items}}<li><a href="{{.}}.git/">{{.}}</a></li>
 {{end}}</ul>
-</body></html>`))
+{{.Footer}}</body></html>`))
 
 func (r *repositories) rootHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
@@ -100,7 +112,14 @@ func (r *repositories) rootHandler(w http.ResponseWriter, req *http.Request) {
 		list = append(list, k)
 	}
 	sort.Strings(list)
-	if err := repoRootTmpl.Execute(w, list); err != nil {
+	t := &struct {
+		Items  []string
+		Footer string
+	}{
+		list,
+		r.footer,
+	}
+	if err := repoRootTmpl.Execute(w, t); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -145,6 +164,7 @@ func (r *repositories) flowHandler(w http.ResponseWriter, req *http.Request) {
 				root:    filepath.Join(r.root, repo),
 				name:    repo,
 				delay:   r.delay,
+				footer:  r.footer,
 				revList: map[string][]string{},
 			}
 			if err := g.initialClone(w); err != nil {
@@ -171,10 +191,12 @@ func (r *repositories) flowHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// TODO(maruel): Split the model-view.
 type git struct {
-	root  string
-	name  string
-	delay time.Duration
+	root   string
+	name   string
+	delay  time.Duration
+	footer string // HTML safe pre-generated footer.
 
 	lock     sync.RWMutex
 	branches map[string]string
@@ -339,7 +361,7 @@ var gitRootTmpl = template.Must(template.New("name").Parse(`<html><body>
 </form>
 {{.Extra}}<p>
 <em>ps: there's a JSON API</em>
-</body></html>`))
+{{.Footer}}</body></html>`))
 
 func (g *git) rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -366,6 +388,7 @@ func (g *git) rootHandler(w http.ResponseWriter, r *http.Request) {
 		Parent string
 		Child  string
 		Extra  string
+		Footer string
 	}{
 		g.name,
 		list,
@@ -373,10 +396,30 @@ func (g *git) rootHandler(w http.ResponseWriter, r *http.Request) {
 		parent,
 		child,
 		extra,
+		g.footer,
 	}
 	if err := gitRootTmpl.Execute(w, t); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// Preload the footer.
+type config struct {
+	UA string
+}
+
+func loadConfig() *config {
+	// TODO(maruel): Very barebone.
+	f, err := os.Open("git-scan.json")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	c := &config{}
+	if err := json.NewDecoder(f).Decode(c); err != nil {
+		return nil
+	}
+	return c
 }
 
 func mainImpl() error {
@@ -390,10 +433,20 @@ func mainImpl() error {
 	if err := os.MkdirAll(*root, 0700); err != nil {
 		return err
 	}
+
+	footer := ""
+	if c := loadConfig(); c != nil {
+		b := &bytes.Buffer{}
+		if err := footerTmpl.Execute(b, c); err != nil {
+			return err
+		}
+		footer = b.String()
+	}
 	repos := &repositories{
-		root:  *root,
-		delay: 60 * time.Second,
-		repos: map[string]*git{},
+		root:   *root,
+		delay:  60 * time.Second,
+		repos:  map[string]*git{},
+		footer: footer,
 	}
 
 	// TODO(maruel): This is a race condition with the parent process.
