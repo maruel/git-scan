@@ -34,13 +34,15 @@ func (l *loggingResponseWriter) WriteHeader(status int) {
 
 func (l *loggingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lW := &loggingResponseWriter{ResponseWriter: w}
+	defer func() {
+		l.log.Printf("%s - %3d %6db %4s %s",
+			r.RemoteAddr,
+			lW.status,
+			lW.length,
+			r.Method,
+			r.RequestURI)
+	}()
 	l.handler.ServeHTTP(lW, r)
-	l.log.Printf("%s - %3d %6db %4s %s",
-		r.RemoteAddr,
-		lW.status,
-		lW.length,
-		r.Method,
-		r.RequestURI)
 }
 
 // restrictedHandler converts an handler to restrict methods to a subset.
@@ -67,6 +69,19 @@ func restrict(h http.Handler, m ...string) http.Handler {
 
 func restrictFunc(h http.HandlerFunc, m ...string) http.Handler {
 	return restrictedHandler{h, m}
+}
+
+type exitOnPanic struct {
+	http.Handler
+}
+
+func (e exitOnPanic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.ServeHTTP(w, r)
+	}()
+	<-done
 }
 
 func handle(m *http.ServeMux, prefix string, h http.Handler) {
