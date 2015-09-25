@@ -11,8 +11,8 @@ import (
 
 // loggingHandler converts an handler to log every HTTP request.
 type loggingHandler struct {
-	handler http.Handler
-	log     *log.Logger
+	http.Handler
+	*log.Logger
 }
 
 type loggingResponseWriter struct {
@@ -35,14 +35,23 @@ func (l *loggingResponseWriter) WriteHeader(status int) {
 func (l *loggingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lW := &loggingResponseWriter{ResponseWriter: w}
 	defer func() {
-		l.log.Printf("%s - %3d %6db %4s %s",
-			r.RemoteAddr,
-			lW.status,
-			lW.length,
-			r.Method,
-			r.RequestURI)
+		if l.Logger != nil {
+			l.Logger.Printf("%s - %3d %6db %4s %s",
+				r.RemoteAddr,
+				lW.status,
+				lW.length,
+				r.Method,
+				r.RequestURI)
+		} else {
+			log.Printf("%s - %3d %6db %4s %s",
+				r.RemoteAddr,
+				lW.status,
+				lW.length,
+				r.Method,
+				r.RequestURI)
+		}
 	}()
-	l.handler.ServeHTTP(lW, r)
+	l.Handler.ServeHTTP(lW, r)
 }
 
 // restrictedHandler converts an handler to restrict methods to a subset.
@@ -79,7 +88,7 @@ func (e exitOnPanic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		e.ServeHTTP(w, r)
+		e.Handler.ServeHTTP(w, r)
 	}()
 	<-done
 }
