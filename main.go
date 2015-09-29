@@ -428,7 +428,7 @@ func mainImpl() error {
 	cwd, _ := os.Getwd()
 	root := flag.String("root", filepath.Join(cwd, "repos"), "checkout root dir")
 	flag.Parse()
-	log.SetFlags(log.Lmicroseconds | log.LUTC)
+	log.SetFlags(log.Ldate | log.Lmicroseconds | log.LUTC)
 
 	if err := os.MkdirAll(*root, 0700); err != nil {
 		return err
